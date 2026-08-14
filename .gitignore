@@ -1,0 +1,29 @@
+# Binaries
+/thnuke
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Vendor (we don't vendor, but just in case)
+/vendor/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+token.txt
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
