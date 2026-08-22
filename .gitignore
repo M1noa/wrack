@@ -1,5 +1,6 @@
 # Binaries
-/thnuke
+wrack
+dist/
 *.exe
 *.dll
 *.so
@@ -17,11 +18,12 @@ go.work.sum
 # Vendor (we don't vendor, but just in case)
 /vendor/
 
-# Env / secrets
+# Env / secrets — never commit tokens or proxies
 .env
 .env.*
 *.pem
-token.txt
+tokens.txt
+proxies.txt
 
 # Editor / OS
 .DS_Store

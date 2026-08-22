@@ -1,23 +1,28 @@
-# thnuke
+# AGENT.md
 
-Experimental Discord "nuke" bot — wipes channels/roles/emojis/messages as fast as the API allows. Built to stress-test Discord rate limits and concurrency patterns. **For experimentation on your own servers only.**
+Discord nuke/raid CLI in Go. Multi-token, proxy-rotated, rate-limit-aware.
 
 ## Setup
-
-```bash
-go build -o thnuke .
-./thnuke -token <BOT_TOKEN> -guild <GUILD_ID>
+```
+go mod download
+make build          # ./wrack
+make release        # dist/ with all 6 platform targets
+./wrack -h
 ```
 
 ## Architecture
-
-- `main.go` — entry, flag parsing, orchestration
-- `wipe.go` — concurrent channel/role/emoji deletion
-- `purge.go` — bulk message deletion (channel-by-channel)
+- `api/` — HTTP client + rate-limit transport + endpoints. Each Client owns its transport/buckets/token.
+- `proxy/` — embedded sources.json → parallel scrape → Discord CDN test (<80ms) → round-robin Pool. SOCKS4 is hand-rolled in socks4.go (x/net lacks it).
+- `token/` — audit (identity/membership/perms), ComputePerms from role bitfields, Shard() for work distribution.
+- `recon/` — read-only guild snapshot, all lists in parallel.
+- `nuke/` — deletion order matters: bulk-ban → automod → invites → channels → emojis/stickers/sounds → roles → strip settings.
+- `raid/` — creation spam with caps from flags.
+- `payload/` — discohook JSON → Message; components v2 auto-flagged with IS_COMPONENTS_V2=32768.
+- `ui/` — random figlet font + HSL gradient banner; AccentColor shared with raid payloads.
 
 ## Gotchas
-
-- Discord rate limits: use `X-RateLimit-Bucket` headers + 429 handling, not fixed delays.
-- `DELETE /channels/:id/messages/:id` is 2/s per channel; bulk-delete (50 msgs, 14-day window) is faster but has its own bucket.
-- Roles: can't delete `@everyone` or managed roles — skip or you'll get 403s and waste requests.
-- Emojis: 50 per guild max, single endpoint, easy win.
+- Go methods can't have type params — generic helpers must be free functions taking *Engine.
+- fanOut is a free generic function in nuke/, not a method; same pattern in raid/.
+- Server tag field on PATCH /guilds 400s on most guilds — always retry without it.
+- Sticker create is multipart-only; JSON path returns errNotImpl (see raid.go TODO).
+- recon.Take uses one probe token; if that token's perms are narrow, some lists come back empty (surfaced as warnings).
