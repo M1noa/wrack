@@ -32,7 +32,7 @@ func Audit(ctx context.Context, raws []string, guildID string, roles []api.Role,
 				return api.NewClient(r, nil)
 			})
 			if err == nil && t.InGuild {
-				t.ComputePerms(roles, ownerID)
+				t.ComputePerms(roles, ownerID, guildID)
 			} else if err != nil {
 				t.Errors = append(t.Errors, err.Error())
 			}

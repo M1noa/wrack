@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"sync"
@@ -97,65 +98,76 @@ func (c *Client) authHeader() string {
 	return c.Token
 }
 
-// Do is the rate-limit-aware request core. It transparently retries on 429
-// and routes via the current proxy.
+// Do is the request core with smart-hammer rate limiting. Successful
+// requests fire back-to-back with zero artificial delay. On 429 we wait
+// exactly the server-stated reset (waiting less just burns cycles and
+// escalates to hour-long global bans — empirically verified), then resume
+// instantly. Escalated punishments (>30s) abort instead of cooking the token.
 func (c *Client) Do(ctx context.Context, method, path string, body any, opts ...ReqOpt) (*http.Response, error) {
 	r := newReq(method, path, body, opts...)
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < 100000; attempt++ {
 		resp, err := c.doOnce(ctx, r)
 		if err != nil {
 			return nil, err
 		}
-		// 429: global or per-route.
+		if b := resp.Header.Get("X-RateLimit-Bucket"); b != "" {
+			c.noteBucket(b, parseFloatReset(resp))
+		}
 		if resp.StatusCode == 429 {
 			retryAfter := parseRetryAfter(resp)
-			bucket := resp.Header.Get("X-RateLimit-Bucket")
-			if bucket != "" {
-				c.lockBucket(bucket, retryAfter)
-			}
 			resp.Body.Close()
+			if retryAfter > 30*time.Second {
+				return nil, fmt.Errorf("api: escalated global ratelimit (%s) on %s %s", retryAfter, method, path)
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(retryAfter + 50*time.Millisecond):
-				continue
+			case <-time.After(retryAfter + 25*time.Millisecond):
 			}
+			continue
 		}
-		// 5xx with retry-after: backoff and retry.
-		if resp.StatusCode >= 500 && attempt < 4 {
-			retryAfter := parseRetryAfter(resp)
+		if resp.StatusCode >= 500 && attempt < 99990 {
 			resp.Body.Close()
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(retryAfter + 100*time.Millisecond):
-				continue
+			case <-time.After(25 * time.Millisecond):
 			}
+			continue
 		}
 		return resp, nil
 	}
-	return nil, fmt.Errorf("api: gave up after retries on %s %s", method, path)
+	return nil, fmt.Errorf("api: gave up on %s %s", method, path)
 }
 
 func (c *Client) doOnce(ctx context.Context, r *req) (*http.Response, error) {
-	// Bucket pre-check.
-	if r.bucket != "" {
-		if until, ok := c.bucketLocked(r.bucket); ok {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(until + 50*time.Millisecond):
-			}
-		}
-	}
-
 	var bodyReader io.Reader
-	if r.body != nil {
+	contentType := ""
+	if r.fileBytes != nil {
+		var buf bytes.Buffer
+		w := multipart.NewWriter(&buf)
+		for k, v := range r.formFields {
+			w.WriteField(k, v)
+		}
+		part, err := w.CreateFormFile(r.fileField, r.fileName)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := part.Write(r.fileBytes); err != nil {
+			return nil, err
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+		bodyReader = &buf
+		contentType = w.FormDataContentType()
+	} else if r.body != nil {
 		buf, err := json.Marshal(r.body)
 		if err != nil {
 			return nil, err
 		}
 		bodyReader = bytes.NewReader(buf)
+		contentType = "application/json"
 	}
 	url := BaseURL + r.path
 	if r.query != "" {
@@ -165,10 +177,12 @@ func (c *Client) doOnce(ctx context.Context, r *req) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", c.authHeader())
+	if !r.noAuth {
+		req.Header.Set("Authorization", c.authHeader())
+	}
 	req.Header.Set("User-Agent", "wrack")
-	if bodyReader != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	if r.reason != "" {
 		req.Header.Set("X-Audit-Log-Reason", r.reason)

@@ -72,12 +72,17 @@ func Audit(ctx context.Context, raw, guildID string, newClient func(string) *api
 	t := &Token{Raw: strings.TrimSpace(raw)}
 	c := newClient(t.Raw)
 
-	// 1. Identity.
+	// 1. Identity (also classifies bot vs user on the client).
 	u, err := c.Me(ctx)
 	if err != nil {
 		return t, fmt.Errorf("auth failed: %w", err)
 	}
 	t.Client = c
+	if u.Bot {
+		t.Kind = "bot"
+	} else {
+		t.Kind = "user"
+	}
 	t.UserID = u.ID
 	t.Username = u.Username
 
@@ -124,8 +129,9 @@ func Audit(ctx context.Context, raw, guildID string, newClient func(string) *api
 }
 
 // ComputePerms fills in the token's effective permissions given the guild's
-// role list and owner ID.
-func (t *Token) ComputePerms(guildRoles []api.Role, ownerID string) {
+// role list and owner ID. The @everyone role (id == guild id) is the baseline
+// even when Discord omits it from member.roles.
+func (t *Token) ComputePerms(guildRoles []api.Role, ownerID, guildID string) {
 	if t.UserID == ownerID {
 		t.Perms = ^int64(0) // owner = all
 		t.IsOwner = true
@@ -136,6 +142,10 @@ func (t *Token) ComputePerms(guildRoles []api.Role, ownerID string) {
 		roleByID[r.ID] = r
 	}
 	var perms int64
+	// Baseline: @everyone applies to every member.
+	if ev, ok := roleByID[guildID]; ok {
+		perms |= parseBits(ev.Perms)
+	}
 	for _, rid := range t.Roles {
 		r, ok := roleByID[rid]
 		if !ok {

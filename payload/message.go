@@ -4,6 +4,7 @@ package payload
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -74,21 +75,15 @@ func DataURI(raw []byte) string {
 	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
 }
 
-// SilentMP3 returns a tiny valid MP3 frame sequence (~26ms of silence per frame,
-// repeated to fill ~0.1s). Meets soundboard's mp3 requirement at minimal size.
+// SilentMP3 returns a real silent mp3 (0.15s, 32kbps mono, 958 bytes),
+// generated once with ffmpeg and embedded at build time.
+//
+//go:embed silent.mp3
+var silentMP3 []byte
+
 func SilentMP3() []byte {
-	// MPEG-1 Layer III, 44.1kHz, mono, 32kbps: frame size = 104 bytes.
-	// Header: 0xFFFB9064 (sync, layer3, no CRC, 32kbps, 44.1kHz, mono).
-	frame := make([]byte, 104)
-	frame[0] = 0xFF
-	frame[1] = 0xFB
-	frame[2] = 0x90
-	frame[3] = 0x64
-	// Rest is zero (silent). Repeat 4 frames ≈ 104ms.
-	out := make([]byte, 0, len(frame)*4)
-	for i := 0; i < 4; i++ {
-		out = append(out, frame...)
-	}
+	out := make([]byte, len(silentMP3))
+	copy(out, silentMP3)
 	return out
 }
 

@@ -21,6 +21,7 @@ make release        # dist/ with all 6 platform targets
 - `ui/` — random figlet font + HSL gradient banner; AccentColor shared with raid payloads.
 
 ## Gotchas
+- NEVER ignore 429 Retry-After. Hammering through small limits escalates to ~45min GLOBAL token bans (empirically verified: retry-after: 2616). Smart-hammer: wait exactly the stated reset (<=30s), abort on >30s punishments.
 - Go methods can't have type params — generic helpers must be free functions taking *Engine.
 - fanOut is a free generic function in nuke/, not a method; same pattern in raid/.
 - Server tag field on PATCH /guilds 400s on most guilds — always retry without it.

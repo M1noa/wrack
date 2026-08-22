@@ -129,22 +129,41 @@ type Member struct {
 
 // ---- endpoints ----
 
-// Me fetches the current user identity.
+// Me fetches the current user identity. Classifies the token on the way:
+// tries "Bot <token>" first, falls back to bare (user) token on 401.
 func (c *Client) Me(ctx context.Context) (*User, error) {
-	resp, err := c.Do(ctx, "GET", "/users/@me", nil)
+	u, err := c.meOnce(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode == 401 {
-		DiscardBody(resp)
-		return nil, fmt.Errorf("invalid token")
-	}
-	var u User
-	if err := DecodeJSON(resp, &u); err != nil {
-		return nil, err
-	}
 	c.UserID = u.ID
-	return &u, nil
+	if u.Bot {
+		c.Kind = "bot"
+	} else {
+		c.Kind = "user"
+	}
+	return u, nil
+}
+
+func (c *Client) meOnce(ctx context.Context) (*User, error) {
+	// Attempt order: bot-prefixed first, then bare.
+	for _, kind := range []string{"bot", "user"} {
+		c.Kind = kind
+		resp, err := c.Do(ctx, "GET", "/users/@me", nil)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == 401 {
+			DiscardBody(resp)
+			continue
+		}
+		var u User
+		if err := DecodeJSON(resp, &u); err != nil {
+			return nil, err
+		}
+		return &u, nil
+	}
+	return nil, fmt.Errorf("invalid token")
 }
 
 // MyGuilds returns guilds visible to a user token.
@@ -178,8 +197,27 @@ func (c *Client) GetGuild(ctx context.Context, guildID string, withCounts bool) 
 }
 
 // MyMembership returns this token's member object in the given guild.
+// Uses the resolved user ID — /members/@me 400s on bot tokens.
 func (c *Client) MyMembership(ctx context.Context, guildID string) (*Member, error) {
-	resp, err := c.Do(ctx, "GET", Path("/guilds/%s/members/@me", guildID), nil)
+	if c.UserID == "" {
+		if _, err := c.Me(ctx); err != nil {
+			return nil, err
+		}
+	}
+	resp, err := c.Do(ctx, "GET", Path("/guilds/%s/members/%s", guildID, c.UserID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var m Member
+	if err := DecodeJSON(resp, &m); err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// GetMember fetches any member by ID.
+func (c *Client) GetMember(ctx context.Context, guildID, userID string) (*Member, error) {
+	resp, err := c.Do(ctx, "GET", Path("/guilds/%s/members/%s", guildID, userID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +355,26 @@ func (c *Client) ListStickers(ctx context.Context, guildID string) ([]Sticker, e
 	return ss, nil
 }
 
+// CreateSticker uploads a new sticker via multipart/form-data.
+// file must be PNG/APNG (or Lottie JSON), <512KB, >=320x320.
+func (c *Client) CreateSticker(ctx context.Context, guildID, name, description, tags, fileName, contentType string, file []byte) (*Sticker, error) {
+	fields := map[string]string{"name": name, "tags": tags}
+	if description != "" {
+		fields["description"] = description
+	}
+	resp, err := c.Do(ctx, "POST", Path("/guilds/%s/stickers", guildID), nil,
+		WithFields(fields),
+		WithFile("file", fileName, contentType, file))
+	if err != nil {
+		return nil, err
+	}
+	var s Sticker
+	if err := DecodeJSON(resp, &s); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // DeleteSticker deletes a sticker by ID.
 func (c *Client) DeleteSticker(ctx context.Context, guildID, stickerID, reason string) error {
 	resp, err := c.Do(ctx, "DELETE", Path("/guilds/%s/stickers/%s", guildID, stickerID), nil, WithReason(reason))
@@ -326,17 +384,20 @@ func (c *Client) DeleteSticker(ctx context.Context, guildID, stickerID, reason s
 	return DiscardBody(resp)
 }
 
-// ListSounds lists soundboard sounds for the guild.
+// ListSounds lists soundboard sounds for the guild. The endpoint returns
+// {"items": [...]} rather than a bare array.
 func (c *Client) ListSounds(ctx context.Context, guildID string) ([]SoundboardSound, error) {
 	resp, err := c.Do(ctx, "GET", Path("/guilds/%s/soundboard-sounds", guildID), nil)
 	if err != nil {
 		return nil, err
 	}
-	var ss []SoundboardSound
-	if err := DecodeJSON(resp, &ss); err != nil {
+	var wrapped struct {
+		Items []SoundboardSound `json:"items"`
+	}
+	if err := DecodeJSON(resp, &wrapped); err != nil {
 		return nil, err
 	}
-	return ss, nil
+	return wrapped.Items, nil
 }
 
 // DeleteSound deletes a soundboard sound by ID.
@@ -551,9 +612,10 @@ func (c *Client) CreateWebhook(ctx context.Context, channelID, name, reason stri
 }
 
 // ExecuteWebhook sends via webhook. wait=true so errors surface.
+// No auth header — the webhook id+token in the path is the credential.
 func (c *Client) ExecuteWebhook(ctx context.Context, webhookID, webhookToken string, body any) error {
 	path := fmt.Sprintf("/webhooks/%s/%s?wait=true", webhookID, webhookToken)
-	resp, err := c.Do(ctx, "POST", path, body)
+	resp, err := c.Do(ctx, "POST", path, body, NoAuth())
 	if err != nil {
 		return err
 	}

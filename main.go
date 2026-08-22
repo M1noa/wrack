@@ -9,7 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/M1noa/wrack/api"
@@ -21,6 +21,7 @@ import (
 	"github.com/M1noa/wrack/recon"
 	"github.com/M1noa/wrack/token"
 	"github.com/M1noa/wrack/ui"
+	"github.com/M1noa/wrack/work"
 )
 
 const version = "0.1.0"
@@ -30,14 +31,15 @@ func main() {
 	var (
 		guildID     = flag.String("guild", "", "target guild ID (required)")
 		tokenFile   = flag.String("tokens", "tokens.txt", "file with one token per line")
-		threads     = flag.Int("threads", 15, "worker threads")
+		threads     = flag.Int("threads", 100, "total worker threads (split across task groups)")
 		mode        = flag.String("mode", "nuke", "nuke|raid|message-only")
 		messageFile = flag.String("message", "", "discohook JSON file (Options→JSON Editor→Download→Plain JSON)")
 		short       = flag.String("short", toolName, "short name used for channels/roles/webhooks/tag/bio/rules")
 		imageFile   = flag.String("image", "", "image file for server pfp + emojis + stickers (optional)")
 		proxyFile   = flag.String("proxy-file", "", "custom proxy list file (one per line)")
 		proxyType   = flag.String("proxy-type", "http", "http|socks4|socks5 (for --proxy-file)")
-		noProxy     = flag.Bool("no-proxy", false, "disable proxies entirely")
+		noProxy     = flag.Bool("no-proxy", false, "disable proxies entirely (direct only)")
+		proxyMode   = flag.String("proxy-mode", "mixed", "mixed|proxy|direct — mixed uses proxies + direct for max speed")
 		noProxyTest = flag.Bool("no-proxy-test", false, "skip startup proxy validation")
 		proxyMs     = flag.Int("proxy-ms", 80, "max proxy latency in ms")
 		noWebhook   = flag.Bool("no-webhook", false, "force-disable webhooks")
@@ -120,12 +122,18 @@ func main() {
 		}
 	}
 
-	// ---- build clients ----
+	// ---- build clients (mixed mode: half direct, half through live proxies) ----
+	var rot api.ProxyRotator
+	switch {
+	case *noProxy || *proxyMode == "direct" || pool == nil:
+		rot = nil
+	case *proxyMode == "proxy":
+		rot = poolRotator{pool}
+	default: // mixed
+		rot = &mixedRotator{pool: pool}
+	}
 	newClient := func(raw string) *api.Client {
-		if pool != nil {
-			return api.NewClient(raw, poolRotator{pool})
-		}
-		return api.NewClient(raw, nil)
+		return api.NewClient(raw, rot)
 	}
 
 	// ---- recon (read-only snapshot) ----
@@ -191,13 +199,21 @@ func main() {
 	}
 
 	// ---- execute ----
+	// One dispatcher, task-grouped: deletion groups + creation groups + ban +
+	// settings all run concurrently with dedicated thread slices.
+	groups := []string{"ban", "delChan", "delRole", "delEmoji", "delSticker",
+		"delSound", "delInvite", "delAuto", "settings",
+		"mkChan", "mkCat", "mkRole", "mkEmoji", "mkSticker", "mkSound", "msg"}
+	disp := work.New(*threads, groups, nil)
+
 	nEngine := nuke.New(&nuke.Config{
 		GuildID:    *guildID,
+		Short:      *short,
 		Ban:        !*noBan,
 		Kick:       *kickInstead,
 		DeleteSecs: *deleteSecs,
 		SkipBans:   *noBan,
-	}, tpool, snap)
+	}, tpool, snap, disp)
 
 	rCfg := &raid.Config{
 		GuildID:     *guildID,
@@ -208,26 +224,28 @@ func main() {
 		MaxStickers: *maxStickers,
 		MaxSounds:   *maxSounds,
 		NSFW:        *nsfwChans,
+		NoWebhook:   *noWebhook,
+		ForceHook:   *forceHook,
 	}
 	if *imageFile != "" {
 		img, err := os.ReadFile(*imageFile)
 		must(err, "read image file")
 		rCfg.ImageData = img
 	}
-	rEngine := raid.New(rCfg, tpool, nEngine, msg)
+	rEngine := raid.New(rCfg, tpool, nEngine, disp, msg)
 
 	switch *mode {
 	case "nuke":
-		must(nEngine.Run(ctx), "nuke")
-		nEngine.StripSettings(ctx)
-		nEngine.SetShortMessage(ctx, *short)
+		nEngine.Run(ctx)
+		disp.Wait()
 	case "raid":
-		must(nEngine.Run(ctx), "nuke phase of raid")
-		nEngine.StripSettings(ctx)
-		nEngine.SetShortMessage(ctx, *short)
-		rEngine.Run(ctx)
+		waitRaid := rEngine.Run(ctx) // creators start immediately...
+		nEngine.Run(ctx)             // ...deletions churn in parallel; only pre-existing stuff dies
+		disp.Wait()
+		waitRaid()
 	case "message-only":
 		rEngine.MessagesOnly(ctx)
+		disp.Wait()
 	}
 
 	ui.Ok("done.")
@@ -237,6 +255,24 @@ func main() {
 type poolRotator struct{ p *proxy.Pool }
 
 func (r poolRotator) Next() api.Proxy { return r.p.Next() }
+
+// mixedRotator alternates direct connections with live proxies — roughly half
+// the traffic rides proxies, half goes direct, maximizing throughput across
+// Discord edges.
+type mixedRotator struct {
+	pool *proxy.Pool
+	n    atomic.Uint64
+}
+
+func (r *mixedRotator) Next() api.Proxy {
+	if r.pool == nil || r.pool.Len() == 0 {
+		return nil
+	}
+	if r.n.Add(1)%2 == 1 {
+		return nil // direct
+	}
+	return r.pool.Next()
+}
 
 func loadTokens(path string) ([]string, error) {
 	b, err := os.ReadFile(path)
@@ -309,5 +345,3 @@ func must(err error, what string) {
 		os.Exit(1)
 	}
 }
-
-var _ = sync.Mutex{}

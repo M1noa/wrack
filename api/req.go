@@ -12,7 +12,16 @@ type req struct {
 	body   any
 	query  string
 	reason string
-	bucket string // optional pre-check bucket id
+	bucket string
+
+	// multipart upload (stickers etc). When fileBytes != nil, body is ignored.
+	formFields map[string]string
+	fileField  string
+	fileName   string
+	fileType   string
+	fileBytes  []byte
+
+	noAuth bool // webhook execute routes don't need the token header
 }
 
 // ReqOpt mutates a req.
@@ -42,6 +51,31 @@ func WithQuery(kv map[string]string) ReqOpt {
 
 // WithBucket sets the bucket id to pre-check before issuing the request.
 func WithBucket(id string) ReqOpt { return func(r *req) { r.bucket = id } }
+
+// WithFields sets multipart form fields (used with WithFile).
+func WithFields(kv map[string]string) ReqOpt {
+	return func(r *req) {
+		if r.formFields == nil {
+			r.formFields = make(map[string]string, len(kv))
+		}
+		for k, v := range kv {
+			r.formFields[k] = v
+		}
+	}
+}
+
+// WithFile attaches a multipart file part.
+func WithFile(field, name, contentType string, data []byte) ReqOpt {
+	return func(r *req) {
+		r.fileField = field
+		r.fileName = name
+		r.fileType = contentType
+		r.fileBytes = data
+	}
+}
+
+// NoAuth skips the Authorization header (webhook execute by id+token).
+func NoAuth() ReqOpt { return func(r *req) { r.noAuth = true } }
 
 // Path builds a snowflake-interpolated path.
 func Path(template string, ids ...any) string {

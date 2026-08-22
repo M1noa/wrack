@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/common-nighthawk/go-figure"
 )
@@ -14,8 +15,9 @@ import (
 // Banner picks a random ASCII font and renders the name with a random gradient.
 func Banner(name string) {
 	fonts := []string{
-		"Standard", "Bold", "Block", "Bubble", "Digital",
-		"Ivy", "Mini", "Script", "Shadow", "Slant", "Speed", "Star Wars",
+		"standard", "block", "bubble", "digital",
+		"mini", "script", "shadow", "slant", "small",
+		"smscript", "smshadow", "smslant",
 	}
 	f := fonts[rand.Intn(len(fonts))]
 	fig := figure.NewFigure(strings.ToUpper(name), f, true)
@@ -76,22 +78,26 @@ func Confirm(prompt string) bool {
 	return s == "y" || s == "yes"
 }
 
-// Progress is a simple single-line counter that redraws itself.
+// Progress is a simple single-line counter that redraws itself. Safe for
+// concurrent ticks.
 type Progress struct {
 	Label string
-	Done  int64
 	Total int64
+	Done  atomic.Int64
 }
 
 // Tick increments done count and redraws.
 func (p *Progress) Tick(n int64) {
-	p.Done += n
+	d := p.Done.Add(n)
 	percent := 0
 	if p.Total > 0 {
-		percent = int(float64(p.Done) / float64(p.Total) * 100)
+		percent = int(float64(d) / float64(p.Total) * 100)
 	}
-	fmt.Printf("\r\x1b[K %s: %d/%d (%d%%)", p.Label, p.Done, p.Total, percent)
+	fmt.Printf("\r\x1b[K %s: %d/%d (%d%%)", p.Label, d, p.Total, percent)
 }
+
+// Count returns ticks so far.
+func (p *Progress) Count() int64 { return p.Done.Load() }
 
 // Finish prints newline after ticks complete.
 func (p *Progress) Finish() { fmt.Println() }
