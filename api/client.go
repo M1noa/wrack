@@ -69,10 +69,25 @@ func NewClient(token string, rotator ProxyRotator) *Client {
 		Rotator: rotator,
 		buckets: make(map[string]*bucket),
 	}
-	c.HTTP = &http.Client{
-		Timeout: 15 * time.Second,
-	}
+	c.HTTP = &http.Client{Timeout: 15 * time.Second}
+	c.tune()
 	return c
+}
+
+// tune maximizes connection throughput: big idle pool, HTTP/2 multiplexing,
+// so dozens of concurrent workers share few TCP handshakes.
+func (c *Client) tune() {
+	if tr, ok := c.HTTP.Transport.(*http.Transport); ok && tr != nil {
+		tr.MaxIdleConns = 0
+		tr.MaxIdleConnsPerHost = 256
+		tr.ForceAttemptHTTP2 = true
+		return
+	}
+	clone := http.DefaultTransport.(*http.Transport).Clone()
+	clone.MaxIdleConns = 0
+	clone.MaxIdleConnsPerHost = 256
+	clone.ForceAttemptHTTP2 = true
+	c.HTTP.Transport = clone
 }
 
 // SetTransport pins a specific transport (used when no proxy rotation).
