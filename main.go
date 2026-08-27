@@ -24,7 +24,7 @@ import (
 	"github.com/M1noa/wrack/work"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 const toolName = "wrack"
 
 func main() {

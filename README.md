@@ -1,53 +1,72 @@
 # wrack
 
-Experimental Discord nuke/raid CLI — multi-token, proxy-rotated, rate-limit-aware. Stress-tests Discord API limits and concurrency patterns. **For experimentation on your own servers only.**
+> THIS PROJECT WAS MADE PARTIALLY USING AGENTIC AI CODING TOOLS
+
+A multi-token Discord nuke/raid CLI written in Go. It fans out deletion and
+creation jobs across many tokens at once, rotates proxies, and backs off on
+Discord rate limits instead of hammering through them.
+
+> **For servers you own or are authorized to test.** Point this at a server you
+> don't control and you're breaking Discord's Terms of Service. Accounts get
+> banned. You're on your own.
+
+## Status
+
+Beta. Current release is **v0.2.0**. See [Versions](#versions).
+
+## Features
+
+- multi-token execution with a per-token permission audit
+- proxy rotation (HTTP / SOCKS4 / SOCKS5) plus a direct fallback
+- rate-limit aware: honors `Retry-After`, aborts on long global bans
+- three modes: `nuke`, `raid`, `message-only`
+- discohook JSON payloads, including components v2
+- read-only recon snapshot taken before any writes
 
 ## Build
 
+Requires Go 1.26+.
+
 ```bash
-make build          # local binary
-make release        # all 6 targets into dist/ (darwin/linux/windows × amd64/arm64)
+make build      # ./wrack for your platform
+make release    # dist/ with all 6 targets (darwin/linux/windows × amd64/arm64)
 ```
 
 ## Usage
 
 ```bash
-./wrack -guild <ID> -tokens tokens.txt [-mode nuke|raid|message-only] [flags]
+./wrack -guild <GUILD_ID> -tokens tokens.txt -mode nuke -y
 ```
 
-Tokens: one per line in `tokens.txt`. Bot tokens and user tokens both work (user tokens are ToS-risky — your call).
+| flag | meaning |
+|------|---------|
+| `-guild` | target guild ID (required) |
+| `-tokens` | one token per line; bot or user tokens |
+| `-mode`  | `nuke` / `raid` / `message-only` |
+| `-y`     | skip the confirmation prompt |
 
-## Flags
+Full flag list: `./wrack -h`.
 
-Run `./wrack -h` for the full list. Highlights:
+## Versions
 
-- `-mode` — `nuke` (wipe), `raid` (wipe + spam-create), `message-only`
-- `-message FILE` — discohook JSON export (Options → JSON Editor → Download → Plain JSON); supports components v2
-- `-short MSG` — name used for channels/roles/webhooks/server tag/bio/rules
-- `-image FILE` — image for server pfp + emojis + stickers
-- `-proxy-file FILE -proxy-type http|socks4|socks5` — custom proxies; otherwise scrapes from embedded list
-- `-no-proxy`, `-no-proxy-test`, `-proxy-ms N` — proxy controls
-- `-y` / `-yes` — skip confirmation
-- `-ignore-errors` — run even if some tokens fail audit
-- `-max-channels/-roles/-emojis/-stickers/-sounds N` — caps on spam creation
+Releases follow `vMAJOR.MINOR.PATCH`. The number is set in `main.go` (`version`)
+and the `Makefile` (`VERSION`), and is printed by `./wrack -version`.
 
-## Architecture
+It bumps on every semi-large or large change. To cut a release:
 
-- `main.go` — flags, orchestration, confirm flow
-- `api/` — HTTP client, rate-limit transport, typed endpoint wrappers
-- `proxy/` — scrape (embedded sources.json) → test against Discord CDN → pool; SOCKS4 hand-rolled, SOCKS5 via x/net
-- `token/` — classify (bot/user), audit membership + perms, shard work
-- `recon/` — read-only snapshot of everything before any writes
-- `perms/` — per-token audit report
-- `nuke/` — ordered deletion engine (bulk-ban first, channels cascade webhooks)
-- `raid/` — creation spam engine (channels/roles/emojis/stickers/sounds/webhooks/messages)
-- `payload/` — discohook parse, components v2 flagging, blank PNG/silent MP3 generation
-- `ui/` — random-font banner, gradient, prompts, progress counters
+```bash
+git tag v0.3.0
+git push origin v0.3.0
+```
 
-## Gotchas
+Pushing a `v*` tag builds every target and publishes them to GitHub Releases.
 
-- Bulk ban (`POST /guilds/:id/bulk-ban`) = 200 users/request, needs BAN_MEMBERS + MANAGE_GUILD.
-- Channel deletion cascades its webhooks + messages — don't double-delete.
-- Server tag isn't writable via standard PATCH /guilds; we send it anyway and ignore 400s.
-- Sticker creation needs multipart upload (TODO — not wired).
-- Roles: can't delete @everyone or managed roles.
+## Disclaimer
+
+Educational and authorized-testing use only. The author takes no responsibility
+for misuse, bans, or damage. You are responsible for following Discord's ToS and
+the law.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
