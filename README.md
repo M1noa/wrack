@@ -8,9 +8,6 @@ Discord rate limits instead of hammering through them.
 
 ---
 
-> **For servers you own or are authorized to test.** Point this at a server you
-> don't control and you're breaking Discord's Terms of Service.
-
 ## Features
 
 - multi-token usage
@@ -37,6 +34,8 @@ make release    # dist/ with all 6 targets (darwin/linux/windows × amd64/arm64)
 Full flag list: `./wrack -h`.
 
 ## Disclaimer
+**For servers you own or are authorized to test.** Point this at a server you
+don't control and you're breaking Discord's Terms of Service.
 
 Educational and authorized-testing use only. The author takes no responsibility
 for misuse, bans, or damage. You are responsible for following Discord's ToS and
