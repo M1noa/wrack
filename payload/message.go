@@ -91,7 +91,7 @@ func SilentMP3() []byte {
 // Uses components v2 with an accent color matching the CLI gradient hue.
 func DefaultRaidMessage(name string, accentColor int) *Message {
 	container := map[string]any{
-		"type":        17, // CONTAINER
+		"type":         17, // CONTAINER
 		"accent_color": accentColor,
 		"components": []any{
 			map[string]any{"type": 10, "content": "# " + name},

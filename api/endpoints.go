@@ -43,25 +43,25 @@ type Guild struct {
 }
 
 type Channel struct {
-	ID        string  `json:"id"`
-	GuildID   string  `json:"guild_id"`
-	Name      string  `json:"name"`
-	Type      int     `json:"type"` // 0=text,2=voice,4=category,5=announce,13=stage,15=forum,16=media
-	ParentID  *string `json:"parent_id"`
-	NSFW      bool    `json:"nsfw"`
-	Topic     *string `json:"topic"`
-	Position  int     `json:"position"`
+	ID       string  `json:"id"`
+	GuildID  string  `json:"guild_id"`
+	Name     string  `json:"name"`
+	Type     int     `json:"type"` // 0=text,2=voice,4=category,5=announce,13=stage,15=forum,16=media
+	ParentID *string `json:"parent_id"`
+	NSFW     bool    `json:"nsfw"`
+	Topic    *string `json:"topic"`
+	Position int     `json:"position"`
 }
 
 type Role struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Color     int    `json:"color"`
-	Hoist     bool   `json:"hoist"`
-	Position  int    `json:"position"`
-	Perms     string `json:"permissions"` // bitfield as string
-	Managed   bool   `json:"managed"`
-	Mentionable bool `json:"mentionable"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Color       int    `json:"color"`
+	Hoist       bool   `json:"hoist"`
+	Position    int    `json:"position"`
+	Perms       string `json:"permissions"` // bitfield as string
+	Managed     bool   `json:"managed"`
+	Mentionable bool   `json:"mentionable"`
 }
 
 type Emoji struct {
@@ -72,22 +72,22 @@ type Emoji struct {
 }
 
 type Sticker struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
 	Description *string `json:"description"`
-	Tags        string `json:"tags"`
-	FormatType  int    `json:"format_type"`
-	Available   bool   `json:"available"`
+	Tags        string  `json:"tags"`
+	FormatType  int     `json:"format_type"`
+	Available   bool    `json:"available"`
 }
 
 type SoundboardSound struct {
-	Name    string  `json:"name"`
-	SoundID string  `json:"sound_id"`
-	Volume  float64 `json:"volume"`
-	EmojiID *string `json:"emoji_id"`
+	Name      string  `json:"name"`
+	SoundID   string  `json:"sound_id"`
+	Volume    float64 `json:"volume"`
+	EmojiID   *string `json:"emoji_id"`
 	EmojiName *string `json:"emoji_name"`
-	Available bool  `json:"available"`
-	GuildID string  `json:"guild_id"`
+	Available bool    `json:"available"`
+	GuildID   string  `json:"guild_id"`
 }
 
 type Invite struct {
@@ -100,23 +100,23 @@ type Invite struct {
 }
 
 type AutoModRule struct {
-	ID         string        `json:"id"`
-	GuildID    string        `json:"guild_id"`
-	Name       string        `json:"name"`
-	CreatorID  string        `json:"creator_id"`
-	EventType  int           `json:"event_type"`
-	TriggerType int          `json:"trigger_type"`
-	Enabled    bool          `json:"enabled"`
+	ID          string `json:"id"`
+	GuildID     string `json:"guild_id"`
+	Name        string `json:"name"`
+	CreatorID   string `json:"creator_id"`
+	EventType   int    `json:"event_type"`
+	TriggerType int    `json:"trigger_type"`
+	Enabled     bool   `json:"enabled"`
 }
 
 type Webhook struct {
-	ID       string  `json:"id"`
-	Type     int     `json:"type"`
-	GuildID  string  `json:"guild_id"`
-	ChannelID string `json:"channel_id"`
-	Name     string  `json:"name"`
-	Token    *string `json:"token"`
-	URL      *string `json:"url"`
+	ID        string  `json:"id"`
+	Type      int     `json:"type"`
+	GuildID   string  `json:"guild_id"`
+	ChannelID string  `json:"channel_id"`
+	Name      string  `json:"name"`
+	Token     *string `json:"token"`
+	URL       *string `json:"url"`
 }
 
 type Member struct {

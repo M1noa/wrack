@@ -17,9 +17,9 @@ type Source struct {
 
 // Sources groups scrape URLs by proxy protocol.
 type Sources struct {
-	HTTP    []Source `json:"http"`
-	SOCKS4  []Source `json:"socks4"`
-	SOCKS5  []Source `json:"socks5"`
+	HTTP   []Source `json:"http"`
+	SOCKS4 []Source `json:"socks4"`
+	SOCKS5 []Source `json:"socks5"`
 }
 
 // LoadEmbedded parses the embedded sources.json (originally sourced from

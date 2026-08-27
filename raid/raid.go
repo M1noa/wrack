@@ -45,11 +45,11 @@ type Engine struct {
 	Disp *work.Dispatcher
 	msg  *payload.Message
 
-	newChans chan api.Channel           // created channels stream to hook pumps
-	cats     []api.Channel              // categories we made (random parents)
-	hooks    map[string]*api.Webhook    // channel id -> webhook
-	seq      map[string]*atomic.Int64   // per-type name counters
-	attempts int                        // retries per slot before giving up
+	newChans chan api.Channel         // created channels stream to hook pumps
+	cats     []api.Channel            // categories we made (random parents)
+	hooks    map[string]*api.Webhook  // channel id -> webhook
+	seq      map[string]*atomic.Int64 // per-type name counters
+	attempts int                      // retries per slot before giving up
 
 	mu sync.Mutex
 }

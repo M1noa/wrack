@@ -326,7 +326,7 @@ func (e *Engine) StripSettings(ctx context.Context) {
 		"discovery_splash":              nil,
 		"description":                   "",
 		"premium_progress_bar_enabled":  false,
-		"tag": "", // best-effort; Discord may 400 this field
+		"tag":                           "", // best-effort; Discord may 400 this field
 	}
 	t := e.nextTok()
 	if t == nil {
