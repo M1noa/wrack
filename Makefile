@@ -12,14 +12,16 @@ TARGETS := \
 build:
 	go build -ldflags '$(LDFLAGS)' -o $(BINARY) .
 
-# release builds every target into dist/
+# release builds every target into dist/ as wrack-v<VERSION>-<os>-<arch>
 release: clean
 	@mkdir -p dist
 	@for t in $(TARGETS); do \
 		os=$${t%/*}; arch=$${t#*/}; \
+		case $$os in darwin) pretty=mac;; linux) pretty=linux;; windows) pretty=windows;; esac; \
+		case $$arch in amd64) parch=x64;; arm64) parch=arm64;; esac; \
 		ext=""; \
 		if [ "$$os" = "windows" ]; then ext=".exe"; fi; \
-		name=$(BINARY)-$$os-$$arch$$ext; \
+		name=$(BINARY)-v$(VERSION)-$$pretty-$$parch$$ext; \
 		echo "building $$name"; \
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
 			go build -trimpath -ldflags '$(LDFLAGS)' -o dist/$$name .; \

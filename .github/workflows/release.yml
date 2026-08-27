@@ -35,9 +35,18 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: |
+          case "$GOOS" in
+            darwin)  pretty=mac;;
+            linux)   pretty=linux;;
+            windows) pretty=windows;;
+          esac
+          case "$GOARCH" in
+            amd64) parch=x64;;
+            arm64)  parch=arm64;;
+          esac
           ext=""
           if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          name="wrack-${GOOS}-${GOARCH}${ext}"
+          name="wrack-${{ steps.ver.outputs.version }}-${pretty}-${parch}${ext}"
           go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}" -o "dist/$name" .
           (cd dist && shasum -a 256 "$name" > "$name.sha256")
       - uses: actions/upload-artifact@v4
